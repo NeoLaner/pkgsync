@@ -4,4 +4,5 @@
 //! binary that wires them into a TUI. Keeping logic in the lib means we can
 //! unit-test it directly (see each module's `#[cfg(test)]` block).
 
+pub mod diff;
 pub mod package;
