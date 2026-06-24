@@ -36,21 +36,26 @@ cargo run -- <args>
 
 ## Usage
 
-Just run it with no arguments and pick a source type interactively:
+Just run it with no arguments and pick a source from the menu:
 
 ```sh
-pkgsync          # opens a menu: SSH or local file → type the host/IP or path
+pkgsync          # menu of remembered sources + ssh_config hosts + "enter new"
 pkgsync demo     # sample data — safe, no machines needed
 ```
 
-The entry menu offers two choices, each prompting for what it needs:
+The entry menu is pre-populated with:
 
-- **SSH** — type a hostname or IP; pkgsync runs `ssh <host> pacman -Qe`.
-- **Local file** — type a path to a `.pkgs` snapshot (offline fallback). `~/`
-  is expanded.
+- **recently-used sources** (persisted in `~/.local/state/pkgsync/recent`), and
+- **`Host` aliases from `~/.ssh/config`**,
 
-Either way the fetch runs on a background thread (so SSH never freezes the UI)
-and the diff appears.
+so you usually just arrow down and press Enter. The last two rows always let you
+enter a new target:
+
+- **+ SSH** — type a hostname or IP; pkgsync runs `ssh <host> pacman -Qe`.
+- **+ Local file** — type a path to a `.pkgs` snapshot (`~/` is expanded).
+
+Either way the fetch runs on a background thread (so SSH never freezes the UI;
+`Esc` cancels a slow one) and the diff appears.
 
 ### Passing targets up front (optional)
 

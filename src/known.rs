@@ -52,7 +52,7 @@ fn serialize_recent(specs: &[SourceSpec]) -> String {
 fn parse_ssh_config_hosts(text: &str) -> Vec<String> {
     let mut hosts = Vec::new();
     for line in text.lines() {
-        let mut tokens = line.trim().split_whitespace();
+        let mut tokens = line.split_whitespace();
         let Some(keyword) = tokens.next() else {
             continue;
         };
