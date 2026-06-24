@@ -39,6 +39,13 @@ impl Filter {
     }
 }
 
+/// Which screen we're on: browsing the diff, or confirming an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Browse,
+    Confirm,
+}
+
 /// All the mutable state of the running app.
 pub struct App {
     /// The full diff, never mutated after construction.
@@ -53,6 +60,11 @@ pub struct App {
     pub list_state: ListState,
     /// Set when the user asks to quit; the main loop checks this.
     pub should_quit: bool,
+    /// Current screen.
+    pub mode: Mode,
+    /// Raised for one loop iteration when the user confirms an action. The main
+    /// loop "takes" it (resetting to false) and runs the plan.
+    apply_requested: bool,
 }
 
 impl App {
@@ -67,6 +79,8 @@ impl App {
             selected: HashSet::new(),
             list_state,
             should_quit: false,
+            mode: Mode::Browse,
+            apply_requested: false,
         }
     }
 
@@ -152,9 +166,16 @@ impl App {
         }
     }
 
-    /// Map a key press to a state change. Returning nothing keeps `main.rs`'s
-    /// event loop trivial — and lets us test the whole keymap without a TUI.
+    /// Map a key press to a state change, dispatched by the current screen.
+    /// Keeping all key meaning here lets us test the whole keymap without a TUI.
     pub fn handle_key(&mut self, code: KeyCode) {
+        match self.mode {
+            Mode::Browse => self.handle_browse_key(code),
+            Mode::Confirm => self.handle_confirm_key(code),
+        }
+    }
+
+    fn handle_browse_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
@@ -164,8 +185,27 @@ impl App {
             KeyCode::Char('i') => self.set_filter(Filter::Install),
             KeyCode::Char('u') => self.set_filter(Filter::Upgrade),
             KeyCode::Char('r') => self.set_filter(Filter::Remove),
+            // Only open the confirm screen if something is actually ticked.
+            KeyCode::Enter if !self.selected.is_empty() => self.mode = Mode::Confirm,
             _ => {}
         }
+    }
+
+    fn handle_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.apply_requested = true;
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
+            _ => {}
+        }
+    }
+
+    /// Consume the one-shot "apply" signal: returns true exactly once after the
+    /// user confirms, resetting itself so the plan runs a single time.
+    pub fn take_apply_request(&mut self) -> bool {
+        std::mem::take(&mut self.apply_requested)
     }
 }
 
@@ -251,5 +291,35 @@ mod tests {
         assert!(!app.should_quit);
         app.handle_key(KeyCode::Char('q'));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn enter_without_selection_does_not_open_confirm() {
+        let mut app = App::new(sample());
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[test]
+    fn confirm_flow_raises_apply_request_once() {
+        let mut app = App::new(sample());
+        app.toggle_current(); // tick something
+        app.handle_key(KeyCode::Enter); // open confirm
+        assert_eq!(app.mode, Mode::Confirm);
+
+        app.handle_key(KeyCode::Char('y')); // confirm
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.take_apply_request()); // fires once...
+        assert!(!app.take_apply_request()); // ...then resets
+    }
+
+    #[test]
+    fn cancelling_confirm_raises_nothing() {
+        let mut app = App::new(sample());
+        app.toggle_current();
+        app.handle_key(KeyCode::Enter);
+        app.handle_key(KeyCode::Esc); // cancel
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(!app.take_apply_request());
     }
 }

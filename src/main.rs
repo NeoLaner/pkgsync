@@ -4,17 +4,19 @@
 //! state; here we just render it and feed key presses into it. Navigate with
 //! ↑/↓ (or j/k), tick rows with Tab/Space, filter with a/i/u/r, quit with q.
 
-use pkgsync::app::App;
+use pkgsync::action::Plan;
+use pkgsync::app::{App, Mode};
 use pkgsync::diff::{diff, Category, DiffEntry, DiffKind};
 use pkgsync::source::{fetch_with_fallback, FileSource, LocalSource, SshSource, Source};
 use ratatui::{
     crossterm::event::{self, Event, KeyEventKind},
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, Paragraph},
+    widgets::{Block, Clear, List, ListItem, Paragraph},
     DefaultTerminal, Frame,
 };
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -89,8 +91,8 @@ fn load_entries(args: &[String]) -> Result<Vec<DiffEntry>, String> {
 }
 
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
-    // The loop now runs until the App says to quit, instead of matching a key
-    // inline. All key meaning lives in `app.handle_key`.
+    // The loop runs until the App says to quit. All key meaning lives in
+    // `app.handle_key`; here we only react to the resulting state.
     while !app.should_quit {
         terminal.draw(|frame| draw(frame, &mut app))?;
 
@@ -99,8 +101,36 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
         {
             app.handle_key(key.code);
         }
+
+        // The user confirmed an action: drop out of the TUI, run it with the
+        // real terminal attached, then exit back to the shell.
+        if app.take_apply_request() {
+            let plan = Plan::from_selection(&app.entries, &app.selected);
+            if !plan.is_empty() {
+                return apply_and_exit(terminal, &plan);
+            }
+        }
     }
     Ok(())
+}
+
+/// Suspend the TUI, run the plan with inherited stdio (so yay's output and sudo
+/// prompt are visible and interactive), wait for the user, then return — the
+/// app exits afterward. We re-enter the alt screen only briefly via `restore`
+/// being idempotent; `main` performs the final teardown.
+fn apply_and_exit(terminal: &mut DefaultTerminal, plan: &Plan) -> std::io::Result<()> {
+    // Leave raw mode + alternate screen so commands print to the normal shell.
+    ratatui::restore();
+    let _ = terminal; // we're done drawing; the handle is no longer used
+
+    let result = plan.execute();
+
+    print!("\n[pkgsync] done — press Enter to exit…");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+
+    result
 }
 
 /// Paint one frame from the current `App` state. Takes `&mut App` because the
@@ -114,6 +144,57 @@ fn draw(frame: &mut Frame, app: &mut App) {
     render_list(frame, list_area, app);
     render_detail(frame, detail_area, app);
     render_footer(frame, footer, app);
+
+    // The confirm screen is drawn as a popup *over* the panes.
+    if app.mode == Mode::Confirm {
+        render_confirm(frame, app);
+    }
+}
+
+/// A modal popup listing exactly what will run, awaiting y/n.
+fn render_confirm(frame: &mut Frame, app: &App) {
+    let plan = Plan::from_selection(&app.entries, &app.selected);
+
+    let mut lines = vec![
+        Line::from(format!("About to act on {} package(s):", plan.total()).bold()),
+        Line::from(""),
+    ];
+    // Show the literal commands that will run — no surprises.
+    for cmd in plan.commands() {
+        lines.push(Line::from(vec![
+            Span::raw("  $ "),
+            Span::styled(cmd.display(), Style::new().fg(Color::Cyan)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" y ", Style::new().fg(Color::Black).bg(Color::Green)),
+        Span::raw(" apply    "),
+        Span::styled(" n ", Style::new().fg(Color::Black).bg(Color::Red)),
+        Span::raw(" cancel"),
+    ]));
+
+    // Center a box that's 70% wide and tall enough for the content.
+    let height = (lines.len() as u16) + 2; // +2 for the border
+    let area = centered_rect(frame.area(), 70, height);
+
+    let popup = Paragraph::new(lines)
+        .block(Block::bordered().title(" confirm ").border_style(Style::new().fg(Color::Yellow)));
+
+    // `Clear` wipes whatever was underneath so the popup isn't see-through.
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+/// A rectangle centered in `area`, `percent_x` wide and `height` rows tall.
+fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
+    let [horizontal] = Layout::horizontal([Constraint::Percentage(percent_x)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [centered] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(horizontal);
+    centered
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -231,6 +312,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" select  "),
         key("a/i/u/r"),
         Span::raw(" filter  "),
+        key("Enter"),
+        Span::raw(" apply  "),
         key("q"),
         Span::raw(" quit   "),
         Span::styled(
