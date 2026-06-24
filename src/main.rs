@@ -1,15 +1,15 @@
 //! pkgsync — interactively diff & sync packages between two Arch machines.
 //!
-//! Stage 4: render a (hard-coded) diff in a real two-pane layout with a
-//! color-coded list. Still static — no selection or actions yet — so we can
-//! focus on ratatui's layout + widget + styling model. The sample data gets
-//! replaced by real sources in a later stage.
+//! Stage 5: a stateful, interactive TUI. The `App` (in `app.rs`) owns all
+//! state; here we just render it and feed key presses into it. Navigate with
+//! ↑/↓ (or j/k), tick rows with Tab/Space, filter with a/i/u/r, quit with q.
 
-use pkgsync::diff::{DiffEntry, DiffKind};
+use pkgsync::app::App;
+use pkgsync::diff::{Category, DiffEntry, DiffKind};
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
-    layout::{Constraint, Layout},
-    style::{Color, Style, Stylize},
+    crossterm::event::{self, Event, KeyEventKind},
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, List, ListItem, Paragraph},
     DefaultTerminal, Frame,
@@ -17,67 +17,64 @@ use ratatui::{
 
 fn main() -> std::io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, App::new(sample_diff()));
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
-    // Hard-coded sample diff so we have something to render. In Stage 6 this
-    // comes from parsing real `pacman -Qe` output of both machines.
-    let entries = sample_diff();
+fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
+    // The loop now runs until the App says to quit, instead of matching a key
+    // inline. All key meaning lives in `app.handle_key`.
+    while !app.should_quit {
+        terminal.draw(|frame| draw(frame, &mut app))?;
 
-    loop {
-        // `draw` needs the data, so we wrap it in a closure that captures
-        // `entries` and forwards the `Frame`.
-        terminal.draw(|frame| draw(frame, &entries))?;
-
-        // A "let-chain" (2024 edition): combine the `if let` pattern match with
-        // extra boolean conditions in one `if`, no nesting required.
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('q')
         {
-            return Ok(());
+            app.handle_key(key.code);
         }
     }
+    Ok(())
 }
 
-/// Paint one frame: a header/list pane on the left, a detail pane on the right,
-/// and a one-line footer.
-fn draw(frame: &mut Frame, entries: &[DiffEntry]) {
-    // Split the screen vertically into a main body and a 1-row footer.
-    // `Layout::vertical(...).areas(area)` returns a fixed-size array we can
-    // destructure directly — cleaner than indexing into a slice.
-    let [body, footer] = Layout::vertical([
-        Constraint::Min(0),    // body takes all remaining space
-        Constraint::Length(1), // footer is exactly one row
-    ])
-    .areas(frame.area());
-
-    // Split the body horizontally: list on the left, detail on the right.
+/// Paint one frame from the current `App` state. Takes `&mut App` because the
+/// list highlight is a *stateful* widget — it reads and updates `list_state`.
+fn draw(frame: &mut Frame, app: &mut App) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
 
-    render_list(frame, list_area, entries);
-    render_detail(frame, detail_area, entries);
-    render_footer(frame, footer);
+    render_list(frame, list_area, app);
+    render_detail(frame, detail_area, app);
+    render_footer(frame, footer, app);
 }
 
-/// The left pane: every diff entry as a colored line inside a titled box.
-fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, entries: &[DiffEntry]) {
-    let items: Vec<ListItem> = entries.iter().map(diff_item).collect();
+fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    // Build owned `ListItem`s first. This borrows `app` immutably, but the
+    // borrow ends with this statement (the items own their strings), freeing us
+    // to take a *mutable* borrow of `app.list_state` below.
+    let items: Vec<ListItem> = app
+        .visible()
+        .iter()
+        .map(|entry| diff_item(entry, app.is_selected(&entry.name)))
+        .collect();
 
-    let title = summary_title(entries);
-    let list = List::new(items).block(Block::bordered().title(title));
+    let title = summary_title(app);
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        // The highlight style is applied to whichever row `list_state` points
+        // at; the symbol is drawn in the left margin of that row.
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .highlight_symbol("› ");
 
-    frame.render_widget(list, area);
+    // `render_stateful_widget` is the key call: it hands the widget our
+    // `ListState`, which is how the moving cursor and scrolling work.
+    frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-/// Turn one diff entry into a styled list row:
-/// `<sym> <action>  <name>            <version detail>`, colored by category.
-fn diff_item(entry: &DiffEntry) -> ListItem<'static> {
-    // Each category gets a symbol, an action verb, a color, and a version blurb.
+/// One styled row: `[x] <sym> <action>  <name>          <detail>`.
+fn diff_item(entry: &DiffEntry, selected: bool) -> ListItem<'static> {
     let (symbol, action, color, detail) = match &entry.kind {
         DiffKind::Missing { remote_version } => {
             ("+", "install", Color::Green, format!("remote {remote_version}"))
@@ -96,60 +93,94 @@ fn diff_item(entry: &DiffEntry) -> ListItem<'static> {
         ),
     };
 
-    // A `Line` is a sequence of `Span`s, each with its own styling. We pad with
-    // `{:<width}` so columns line up regardless of name length.
+    let checkbox = if selected { "[x] " } else { "[ ] " };
+
     let line = Line::from(vec![
+        Span::raw(checkbox),
         Span::styled(format!("{symbol} "), Style::new().fg(color)),
         Span::styled(format!("{action:<8}"), Style::new().fg(color).bold()),
-        Span::raw(format!("{:<24}", entry.name)),
+        Span::raw(format!("{:<22}", entry.name)),
         Span::raw(detail).dim(),
     ]);
 
     ListItem::new(line)
 }
 
-/// The right pane. For now (no selection yet) it just shows a legend and the
-/// per-category counts. Stage 5 turns this into a live detail view of the
-/// currently highlighted package.
-fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, entries: &[DiffEntry]) {
-    let (install, upgrade, remove) = counts(entries);
-
-    let lines = vec![
-        Line::from("Legend".bold()),
-        Line::from(vec![Span::styled("+ install", Style::new().fg(Color::Green))]),
-        Line::from(vec![Span::styled("~ upgrade", Style::new().fg(Color::Yellow))]),
-        Line::from(vec![Span::styled("- remove", Style::new().fg(Color::Red))]),
-        Line::from(""),
-        Line::from(format!("{install} to install")),
-        Line::from(format!("{upgrade} to upgrade")),
-        Line::from(format!("{remove} to remove")),
-        Line::from(""),
-        Line::from("(selection & per-package".dim()),
-        Line::from(" detail land in stage 5)".dim()),
-    ];
-
+/// The right pane: live detail of the highlighted entry.
+fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
+    let lines = match app.selected_entry() {
+        Some(entry) => detail_lines(entry, app.is_selected(&entry.name)),
+        None => vec![Line::from("— nothing here —".dim())],
+    };
     let detail = Paragraph::new(lines).block(Block::bordered().title(" detail "));
     frame.render_widget(detail, area);
 }
 
-/// The bottom help line.
-fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
+fn detail_lines(entry: &DiffEntry, selected: bool) -> Vec<Line<'static>> {
+    let (action, color, versions): (&str, Color, Vec<Line>) = match &entry.kind {
+        DiffKind::Missing { remote_version } => (
+            "install",
+            Color::Green,
+            vec![Line::from(format!("remote version : {remote_version}"))],
+        ),
+        DiffKind::Extra { local_version } => (
+            "remove",
+            Color::Red,
+            vec![Line::from(format!("local version  : {local_version}"))],
+        ),
+        DiffKind::VersionSkew {
+            local_version,
+            remote_version,
+        } => (
+            "upgrade",
+            Color::Yellow,
+            vec![
+                Line::from(format!("local version  : {local_version}")),
+                Line::from(format!("remote version : {remote_version}")),
+            ],
+        ),
+    };
+
+    let mut lines = vec![
+        Line::from(entry.name.clone().bold()),
+        Line::from(Span::styled(action, Style::new().fg(color).bold())),
+        Line::from(""),
+    ];
+    lines.extend(versions);
+    lines.push(Line::from(""));
+    lines.push(Line::from(if selected {
+        "✓ selected for action".green()
+    } else {
+        "· not selected".dim()
+    }));
+    lines
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let key = |k: &'static str| Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(Color::Gray));
     let help = Line::from(vec![
-        Span::styled(" q ", Style::new().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" quit"),
+        key("↑↓"),
+        Span::raw(" move  "),
+        key("Tab"),
+        Span::raw(" select  "),
+        key("a/i/u/r"),
+        Span::raw(" filter  "),
+        key("q"),
+        Span::raw(" quit   "),
+        Span::styled(
+            format!("[filter: {}]  [selected: {}]", app.filter.label(), app.selected.len()),
+            Style::new().fg(Color::DarkGray),
+        ),
     ]);
     frame.render_widget(Paragraph::new(help), area);
 }
 
-/// Build the list's title with a quick breakdown of how many of each category.
-fn summary_title(entries: &[DiffEntry]) -> String {
-    let (install, upgrade, remove) = counts(entries);
+fn summary_title(app: &App) -> String {
+    let (install, upgrade, remove) = counts(&app.entries);
     format!(" diff — {install} install · {upgrade} upgrade · {remove} remove ")
 }
 
-/// Count entries per category in a single pass.
 fn counts(entries: &[DiffEntry]) -> (usize, usize, usize) {
-    use pkgsync::diff::Category;
     let mut install = 0;
     let mut upgrade = 0;
     let mut remove = 0;
@@ -163,20 +194,16 @@ fn counts(entries: &[DiffEntry]) -> (usize, usize, usize) {
     (install, upgrade, remove)
 }
 
-/// Placeholder data until we wire up real package sources.
+/// Placeholder data until we wire up real package sources (Stage 6).
 fn sample_diff() -> Vec<DiffEntry> {
     vec![
         DiffEntry {
             name: "btop".to_string(),
-            kind: DiffKind::Missing {
-                remote_version: "1.4.0-1".to_string(),
-            },
+            kind: DiffKind::Missing { remote_version: "1.4.0-1".to_string() },
         },
         DiffEntry {
             name: "discord".to_string(),
-            kind: DiffKind::Extra {
-                local_version: "0.0.49-1".to_string(),
-            },
+            kind: DiffKind::Extra { local_version: "0.0.49-1".to_string() },
         },
         DiffEntry {
             name: "hyprland".to_string(),
@@ -187,15 +214,11 @@ fn sample_diff() -> Vec<DiffEntry> {
         },
         DiffEntry {
             name: "neovim".to_string(),
-            kind: DiffKind::Missing {
-                remote_version: "0.10.2-1".to_string(),
-            },
+            kind: DiffKind::Missing { remote_version: "0.10.2-1".to_string() },
         },
         DiffEntry {
             name: "ripgrep".to_string(),
-            kind: DiffKind::Missing {
-                remote_version: "14.1.0-1".to_string(),
-            },
+            kind: DiffKind::Missing { remote_version: "14.1.0-1".to_string() },
         },
     ]
 }
