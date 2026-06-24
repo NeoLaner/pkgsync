@@ -7,3 +7,4 @@
 pub mod app;
 pub mod diff;
 pub mod package;
+pub mod source;

@@ -5,7 +5,8 @@
 //! ↑/↓ (or j/k), tick rows with Tab/Space, filter with a/i/u/r, quit with q.
 
 use pkgsync::app::App;
-use pkgsync::diff::{Category, DiffEntry, DiffKind};
+use pkgsync::diff::{diff, Category, DiffEntry, DiffKind};
+use pkgsync::source::{fetch_with_fallback, FileSource, LocalSource, SshSource, Source};
 use ratatui::{
     crossterm::event::{self, Event, KeyEventKind},
     layout::{Constraint, Layout, Rect},
@@ -14,12 +15,77 @@ use ratatui::{
     widgets::{Block, List, ListItem, Paragraph},
     DefaultTerminal, Frame,
 };
+use std::path::Path;
+use std::process::ExitCode;
 
-fn main() -> std::io::Result<()> {
+const USAGE: &str = "\
+pkgsync — diff this machine's packages against another's
+
+USAGE:
+    pkgsync <remote> [fallback-file]   compare local vs a remote
+    pkgsync demo                       run with sample data (no machines needed)
+
+<remote> is either a path to a .pkgs state file, or an SSH host.
+If <remote> is an SSH host, you can pass a state file as a fallback for when
+the host is unreachable.";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Build the diff BEFORE entering the alternate screen, so any error prints
+    // cleanly to the normal terminal instead of being wiped by TUI teardown.
+    let entries = match load_entries(&args) {
+        Ok(entries) => entries,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(sample_diff()));
+    let result = run(&mut terminal, App::new(entries));
     ratatui::restore();
-    result
+
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Decide where packages come from based on CLI args, then compute the diff.
+/// Returns a user-facing error string on any failure.
+fn load_entries(args: &[String]) -> Result<Vec<DiffEntry>, String> {
+    match args.first().map(String::as_str) {
+        None => Err(USAGE.to_string()),
+        Some("demo") => Ok(demo_diff()),
+        Some(remote_arg) => {
+            let local = LocalSource
+                .fetch()
+                .map_err(|e| format!("reading local packages: {e}"))?;
+
+            // A path that exists -> file source; otherwise treat it as an SSH host.
+            let remote = if Path::new(remote_arg).is_file() {
+                FileSource::new(remote_arg)
+                    .fetch()
+                    .map_err(|e| format!("reading remote: {e}"))?
+            } else {
+                let ssh = SshSource::new(remote_arg);
+                match args.get(1) {
+                    // SSH with a state-file fallback.
+                    Some(fallback) => {
+                        let (packages, _origin) =
+                            fetch_with_fallback(&ssh, &FileSource::new(fallback))
+                                .map_err(|e| format!("reading remote (ssh+fallback): {e}"))?;
+                        packages
+                    }
+                    None => ssh.fetch().map_err(|e| format!("reading remote (ssh): {e}"))?,
+                }
+            };
+
+            Ok(diff(&local, &remote))
+        }
+    }
 }
 
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
@@ -194,8 +260,9 @@ fn counts(entries: &[DiffEntry]) -> (usize, usize, usize) {
     (install, upgrade, remove)
 }
 
-/// Placeholder data until we wire up real package sources (Stage 6).
-fn sample_diff() -> Vec<DiffEntry> {
+/// Sample data for `pkgsync demo` — lets you see the UI without a second
+/// machine reachable.
+fn demo_diff() -> Vec<DiffEntry> {
     vec![
         DiffEntry {
             name: "btop".to_string(),
