@@ -9,7 +9,9 @@ use pkgsync::action::Plan;
 use pkgsync::app::{App, InputKind, MenuItem, Mode, Screen};
 use pkgsync::diff::{diff, Category, DiffEntry, DiffKind};
 use pkgsync::known;
+use pkgsync::package::serialize_packages;
 use pkgsync::source::{discover, LocalSource, Source, SourceSpec};
+use std::path::Path;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Flex, Layout, Position, Rect},
@@ -115,6 +117,11 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
             app.on_fetch_result(epoch, result);
         }
 
+        // Snapshot this machine's packages to the requested path (fast, local).
+        if let Some(path) = app.take_snapshot_request() {
+            app.finish_snapshot(do_snapshot(&path));
+        }
+
         // Apply confirmed changes: suspend the TUI, run yay, then refresh.
         if app.take_apply_request() {
             let plan = Plan::from_selection(&app.entries, &app.selected);
@@ -125,6 +132,24 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write this machine's explicit packages to `path` in `pacman -Qe` format.
+/// Returns a human summary on success. Fast enough to run on the UI thread.
+fn do_snapshot(path: &Path) -> Result<String, String> {
+    let packages = LocalSource
+        .fetch()
+        .map_err(|e| format!("reading local packages: {e}"))?;
+    let body = serialize_packages(&packages);
+
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, &body).map_err(|e| format!("writing {}: {e}", path.display()))?;
+
+    Ok(format!("Wrote {} packages to {}", packages.len(), path.display()))
 }
 
 /// Run on a worker thread: gather local + remote package lists and diff them.
@@ -164,8 +189,24 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Picker => render_picker(frame, app),
         Screen::Loading => render_loading(frame, app),
         Screen::Diff => render_diff(frame, app),
+        Screen::Notice(message) => render_notice(frame, &message),
         Screen::Error(message) => render_error(frame, &message),
     }
+}
+
+fn render_notice(frame: &mut Frame, message: &str) {
+    let lines = vec![
+        Line::from("done".bold().green()),
+        Line::from(""),
+        Line::from(message.to_string()),
+        Line::from(""),
+        Line::from("press any key to continue · q to quit".dim()),
+    ];
+    let area = centered_rect(frame.area(), 70, lines.len() as u16 + 2);
+    let popup = Paragraph::new(lines)
+        .block(Block::bordered().title(" snapshot ").border_style(Style::new().fg(Color::Green)));
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
 }
 
 fn render_menu(frame: &mut Frame, app: &mut App) {
@@ -187,6 +228,9 @@ fn render_menu(frame: &mut Frame, app: &mut App) {
                 }
                 MenuItem::NewFile => {
                     Line::from("+ Local file — enter a path".to_string()).dim()
+                }
+                MenuItem::Snapshot => {
+                    Line::from("⎙ Snapshot this machine to a file".to_string()).dim()
                 }
             };
             ListItem::new(line)
@@ -221,6 +265,11 @@ fn render_input(frame: &mut Frame, app: &App) {
             " local file ",
             "Path to a .pkgs file:",
             "e.g. ~/dev/linux/dotconfigs/state/office.pkgs",
+        ),
+        InputKind::Snapshot => (
+            " snapshot this machine ",
+            "Save my packages to path:",
+            "e.g. ~/dev/linux/dotconfigs/state/neo-arch.pkgs",
         ),
     };
 

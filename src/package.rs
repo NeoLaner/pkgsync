@@ -72,6 +72,15 @@ pub fn parse_package_list(raw: &str) -> Result<Vec<Package>, ParseError> {
         .collect()
 }
 
+/// Serialize packages back into `pacman -Qe` format (`<name> <version>` lines,
+/// newline-terminated). The inverse of `parse_package_list`, used for snapshots.
+pub fn serialize_packages(packages: &[Package]) -> String {
+    packages
+        .iter()
+        .map(|p| format!("{} {}\n", p.name, p.version))
+        .collect()
+}
+
 /// Parse a single `<name> <version>` line. Returns `None` if it doesn't have
 /// exactly those two whitespace-separated fields.
 fn parse_line(line: &str) -> Option<Package> {
@@ -145,5 +154,12 @@ mod tests {
     #[test]
     fn empty_input_is_empty_list() {
         assert_eq!(parse_package_list("").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn serialize_round_trips_with_parse() {
+        let pkgs = vec![pkg("alacritty", "0.17.0-1"), pkg("ffmpeg", "2:7.1-3")];
+        let text = serialize_packages(&pkgs);
+        assert_eq!(parse_package_list(&text).unwrap(), pkgs);
     }
 }

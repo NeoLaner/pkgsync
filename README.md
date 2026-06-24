@@ -48,11 +48,14 @@ The entry menu is pre-populated with:
 - **recently-used sources** (persisted in `~/.local/state/pkgsync/recent`), and
 - **`Host` aliases from `~/.ssh/config`**,
 
-so you usually just arrow down and press Enter. The last two rows always let you
-enter a new target:
+so you usually just arrow down and press Enter. The remaining rows let you enter a new target or snapshot this machine:
 
 - **+ SSH** — type a hostname or IP; pkgsync runs `ssh <host> pacman -Qe`.
 - **+ Local file** — type a path to a `.pkgs` snapshot (`~/` is expanded).
+- **⎙ Snapshot this machine** — type a path; pkgsync writes this machine's
+  `pacman -Qe` to it (creating parent dirs, overwriting if present). This is the
+  in-app way to publish your own package list for the other machine to compare
+  against — no shell step needed.
 
 Either way the fetch runs on a background thread (so SSH never freezes the UI;
 `Esc` cancels a slow one) and the diff appears.
@@ -128,8 +131,9 @@ see the updated state.
 
 ## Publishing a machine's package list (for the file / offline path)
 
-pkgsync does not publish your own list. To compare via files, each machine dumps
-its explicit packages into the shared dotfiles repo:
+Use the **⎙ Snapshot this machine** menu entry to write this machine's package
+list to a path in the shared repo, then commit & push it so the other machine
+can compare against it. The equivalent on the shell is:
 
 ```sh
 pacman -Qe > ~/dev/linux/dotconfigs/state/$(uname -n).pkgs
@@ -137,9 +141,6 @@ git -C ~/dev/linux/dotconfigs add state/ && \
   git -C ~/dev/linux/dotconfigs commit -m "pkg state: $(uname -n)" && \
   git -C ~/dev/linux/dotconfigs push
 ```
-
-(There's also `functional-scripts/pkg-publish.sh --push` in the dotfiles repo
-that does exactly this.)
 
 ## Live SSH requirements
 

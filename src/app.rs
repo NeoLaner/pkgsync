@@ -51,20 +51,23 @@ pub enum Mode {
     Confirm,
 }
 
-/// Which kind of source the user is currently typing the details for.
+/// What the text field is collecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
     Ssh,
     File,
+    /// A destination path for snapshotting this machine's packages.
+    Snapshot,
 }
 
-/// An entry in the source menu: a remembered source to pick directly, or a
-/// prompt to enter a new one.
+/// An entry in the source menu: a remembered source to pick directly, a prompt
+/// to enter a new one, or the snapshot action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
     Source(SourceSpec),
     NewSsh,
     NewFile,
+    Snapshot,
 }
 
 /// The top-level screen the app is showing.
@@ -80,6 +83,8 @@ pub enum Screen {
     Loading,
     /// Showing the diff (interaction governed by `Mode`).
     Diff,
+    /// A success/info message (e.g. snapshot written); the string is the text.
+    Notice(String),
     /// A fetch failed; the string is the message to show.
     Error(String),
 }
@@ -122,6 +127,8 @@ pub struct App {
     apply_requested: bool,
     /// One-shot: a fetch the main loop should start on a worker thread.
     pending_fetch: Option<SourceSpec>,
+    /// One-shot: a destination path the main loop should snapshot to.
+    pending_snapshot: Option<PathBuf>,
     /// Incremented on every fetch request/cancel. A worker's result is only
     /// applied if it still matches — so superseded or cancelled fetches are
     /// ignored when they finally land.
@@ -154,6 +161,7 @@ impl App {
             should_quit: false,
             apply_requested: false,
             pending_fetch: None,
+            pending_snapshot: None,
             fetch_epoch: 0,
         };
         if app.specs.len() == 1 {
@@ -176,6 +184,7 @@ impl App {
         let mut items: Vec<MenuItem> = known.into_iter().map(MenuItem::Source).collect();
         items.push(MenuItem::NewSsh);
         items.push(MenuItem::NewFile);
+        items.push(MenuItem::Snapshot);
         app.menu_items = items;
         app.menu_state.select(Some(0));
         app.screen = Screen::Menu;
@@ -377,7 +386,7 @@ impl App {
                 Mode::Browse => self.handle_browse_key(code),
                 Mode::Confirm => self.handle_confirm_key(code),
             },
-            Screen::Error(_) => match code {
+            Screen::Notice(_) | Screen::Error(_) => match code {
                 KeyCode::Char('q') => self.should_quit = true,
                 _ => self.screen = self.entry_screen(), // any other key -> back
             },
@@ -395,6 +404,7 @@ impl App {
                     Some(MenuItem::Source(spec)) => self.request_fetch(spec),
                     Some(MenuItem::NewSsh) => self.start_input(InputKind::Ssh),
                     Some(MenuItem::NewFile) => self.start_input(InputKind::File),
+                    Some(MenuItem::Snapshot) => self.start_input(InputKind::Snapshot),
                     None => {}
                 }
             }
@@ -432,18 +442,31 @@ impl App {
         }
     }
 
-    /// Turn the typed text into a `SourceSpec` and kick off a fetch. Empty input
-    /// is ignored so Enter on a blank field does nothing.
+    /// Act on the typed text: start a fetch (SSH/File) or request a snapshot.
+    /// Empty input is ignored so Enter on a blank field does nothing.
     fn submit_input(&mut self) {
         let text = self.input.trim();
         if text.is_empty() {
             return;
         }
-        let spec = match self.input_kind {
-            InputKind::Ssh => SourceSpec::Ssh(text.to_string()),
-            InputKind::File => SourceSpec::File(expand_tilde(text)),
+        match self.input_kind {
+            InputKind::Ssh => self.request_fetch(SourceSpec::Ssh(text.to_string())),
+            InputKind::File => self.request_fetch(SourceSpec::File(expand_tilde(text))),
+            InputKind::Snapshot => self.pending_snapshot = Some(expand_tilde(text)),
+        }
+    }
+
+    /// Consume a pending snapshot destination (the main loop does the write).
+    pub fn take_snapshot_request(&mut self) -> Option<PathBuf> {
+        self.pending_snapshot.take()
+    }
+
+    /// Show the outcome of a snapshot: a green notice on success, error on fail.
+    pub fn finish_snapshot(&mut self, result: Result<String, String>) {
+        self.screen = match result {
+            Ok(message) => Screen::Notice(message),
+            Err(message) => Screen::Error(message),
         };
-        self.request_fetch(spec);
     }
 
     fn handle_picker_key(&mut self, code: KeyCode) {
@@ -675,15 +698,18 @@ mod tests {
         let app = App::interactive(Vec::new());
         assert_eq!(app.screen, Screen::Menu);
         assert_eq!(app.menu_state.selected(), Some(0));
-        // empty known list -> just the two "enter new" prompts
-        assert_eq!(app.menu_items, vec![MenuItem::NewSsh, MenuItem::NewFile]);
+        // empty known list -> the "enter new" prompts plus snapshot
+        assert_eq!(
+            app.menu_items,
+            vec![MenuItem::NewSsh, MenuItem::NewFile, MenuItem::Snapshot]
+        );
     }
 
     #[test]
     fn known_sources_come_first_and_fetch_on_select() {
         let mut app = App::interactive(vec![SourceSpec::Ssh("office".into())]);
-        // row 0 = office, row 1 = NewSsh, row 2 = NewFile
-        assert_eq!(app.menu_items.len(), 3);
+        // row 0 = office, then NewSsh / NewFile / Snapshot
+        assert_eq!(app.menu_items.len(), 4);
         app.handle_key(KeyCode::Enter); // pick "office"
         assert_eq!(app.screen, Screen::Loading);
         assert_eq!(app.take_fetch_request(), Some(SourceSpec::Ssh("office".into())));
@@ -742,6 +768,38 @@ mod tests {
         app.handle_key(KeyCode::Enter);
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.screen, Screen::Menu);
+    }
+
+    #[test]
+    fn snapshot_menu_opens_snapshot_input() {
+        let mut app = App::interactive(Vec::new());
+        app.handle_key(KeyCode::Up); // wrap to last row = Snapshot
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.screen, Screen::Input);
+        assert_eq!(app.input_kind, InputKind::Snapshot);
+    }
+
+    #[test]
+    fn snapshot_submit_requests_write_with_tilde_expanded() {
+        let mut app = App::interactive(Vec::new());
+        app.handle_key(KeyCode::Up); // Snapshot
+        app.handle_key(KeyCode::Enter);
+        for c in "~/snap.pkgs".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        app.handle_key(KeyCode::Enter);
+        let path = app.take_snapshot_request().expect("snapshot requested");
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        assert_eq!(path, PathBuf::from(home).join("snap.pkgs"));
+    }
+
+    #[test]
+    fn finish_snapshot_sets_notice_or_error() {
+        let mut app = App::interactive(Vec::new());
+        app.finish_snapshot(Ok("wrote 5 packages".into()));
+        assert_eq!(app.screen, Screen::Notice("wrote 5 packages".into()));
+        app.finish_snapshot(Err("disk full".into()));
+        assert_eq!(app.screen, Screen::Error("disk full".into()));
     }
 
     #[test]
