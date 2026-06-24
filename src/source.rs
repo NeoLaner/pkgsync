@@ -7,7 +7,7 @@
 //! tiny generic helper.
 
 use crate::package::{parse_package_list, Package, ParseError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Anything that can yield a list of packages.
@@ -172,6 +172,69 @@ pub fn fetch_with_fallback(
     }
 }
 
+/// A lightweight, cloneable description of *where* to fetch from.
+///
+/// Unlike the `Box<dyn Source>` trait objects, a `SourceSpec` is plain data
+/// (`Clone + Send + 'static`), so it can be moved into a worker thread to do the
+/// (possibly slow) fetch off the UI thread. It builds the real `Source` on demand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceSpec {
+    Local,
+    File(PathBuf),
+    Ssh(String),
+}
+
+impl SourceSpec {
+    /// Human label for the picker list.
+    pub fn label(&self) -> String {
+        match self {
+            SourceSpec::Local => "local (pacman -Qe)".to_string(),
+            SourceSpec::File(path) => format!("file: {}", path.display()),
+            SourceSpec::Ssh(host) => format!("ssh: {host}"),
+        }
+    }
+
+    fn build(&self) -> Box<dyn Source> {
+        match self {
+            SourceSpec::Local => Box::new(LocalSource),
+            SourceSpec::File(path) => Box::new(FileSource::new(path.clone())),
+            SourceSpec::Ssh(host) => Box::new(SshSource::new(host.clone())),
+        }
+    }
+
+    /// Fetch the package list this spec points at.
+    pub fn fetch(&self) -> Result<Vec<Package>, SourceError> {
+        self.build().fetch()
+    }
+}
+
+/// Turn CLI arguments into a list of comparison targets:
+/// * an existing **directory** is scanned for `*.pkgs` files (each becomes a file source),
+/// * an existing **file** becomes a file source,
+/// * anything else is treated as an **SSH host**.
+pub fn discover(args: &[String]) -> Vec<SourceSpec> {
+    let mut specs = Vec::new();
+    for arg in args {
+        let path = Path::new(arg);
+        if path.is_dir() {
+            if let Ok(read_dir) = std::fs::read_dir(path) {
+                let mut files: Vec<PathBuf> = read_dir
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|p| p.extension().is_some_and(|ext| ext == "pkgs"))
+                    .collect();
+                files.sort(); // deterministic order in the picker
+                specs.extend(files.into_iter().map(SourceSpec::File));
+            }
+        } else if path.is_file() {
+            specs.push(SourceSpec::File(path.to_path_buf()));
+        } else {
+            specs.push(SourceSpec::Ssh(arg.clone()));
+        }
+    }
+    specs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +300,41 @@ mod tests {
 
         // both fail -> error surfaces.
         assert!(fetch_with_fallback(&Fake { result: Err(()) }, &Fake { result: Err(()) }).is_err());
+    }
+
+    #[test]
+    fn discover_classifies_args() {
+        // A non-path arg is an SSH host.
+        let specs = discover(&["office".to_string()]);
+        assert_eq!(specs, vec![SourceSpec::Ssh("office".to_string())]);
+    }
+
+    #[test]
+    fn discover_scans_directory_for_pkgs_files() {
+        // Build a temp dir with two .pkgs files and one unrelated file.
+        let dir = std::env::temp_dir().join("pkgsync_discover_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("office.pkgs"), "vim 9\n").unwrap();
+        std::fs::write(dir.join("laptop.pkgs"), "git 2\n").unwrap();
+        std::fs::write(dir.join("README.md"), "ignore me").unwrap();
+
+        let specs = discover(&[dir.display().to_string()]);
+        let files: Vec<_> = specs
+            .iter()
+            .filter_map(|s| match s {
+                SourceSpec::File(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files, vec!["laptop.pkgs", "office.pkgs"]); // sorted, .md excluded
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spec_labels_are_distinct() {
+        assert!(SourceSpec::Local.label().contains("local"));
+        assert!(SourceSpec::Ssh("h".into()).label().starts_with("ssh:"));
+        assert!(SourceSpec::File("/x.pkgs".into()).label().starts_with("file:"));
     }
 }

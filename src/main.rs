@@ -1,141 +1,312 @@
 //! pkgsync — interactively diff & sync packages between two Arch machines.
 //!
-//! Stage 5: a stateful, interactive TUI. The `App` (in `app.rs`) owns all
-//! state; here we just render it and feed key presses into it. Navigate with
-//! ↑/↓ (or j/k), tick rows with Tab/Space, filter with a/i/u/r, quit with q.
+//! Stage 8: sources live inside the TUI. You pick a source from a list, the
+//! fetch runs on a background thread (so SSH never freezes the UI), and the
+//! event loop polls instead of blocking — animating a spinner and draining the
+//! worker's result over a channel. Applying changes refreshes in place.
 
 use pkgsync::action::Plan;
-use pkgsync::app::{App, Mode};
+use pkgsync::app::{App, InputKind, MenuItem, Mode, Screen};
 use pkgsync::diff::{diff, Category, DiffEntry, DiffKind};
-use pkgsync::source::{fetch_with_fallback, FileSource, LocalSource, SshSource, Source};
+use pkgsync::known;
+use pkgsync::source::{discover, LocalSource, Source, SourceSpec};
 use ratatui::{
-    crossterm::event::{self, Event, KeyEventKind},
-    layout::{Constraint, Flex, Layout, Rect},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    layout::{Constraint, Flex, Layout, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Clear, List, ListItem, Paragraph},
     DefaultTerminal, Frame,
 };
 use std::io::Write;
-use std::path::Path;
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const USAGE: &str = "\
-pkgsync — diff this machine's packages against another's
+pkgsync — diff this machine's packages against another's, interactively
 
 USAGE:
-    pkgsync <remote> [fallback-file]   compare local vs a remote
-    pkgsync demo                       run with sample data (no machines needed)
+    pkgsync <target>...   one or more comparison targets, then pick in-app
+    pkgsync demo          run with sample data (no machines needed)
 
-<remote> is either a path to a .pkgs state file, or an SSH host.
-If <remote> is an SSH host, you can pass a state file as a fallback for when
-the host is unreachable.";
+Each <target> is either:
+    - a path to a .pkgs state file        -> that file
+    - a directory                         -> every *.pkgs file inside it
+    - anything else                       -> an SSH host (ssh <host> pacman -Qe)
+
+Example:
+    pkgsync ~/dotconfigs/state office     # pick from state files or live SSH";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Build the diff BEFORE entering the alternate screen, so any error prints
-    // cleanly to the normal terminal instead of being wiped by TUI teardown.
-    let entries = match load_entries(&args) {
-        Ok(entries) => entries,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::from(2);
+    let app = match args.first().map(String::as_str) {
+        // No targets: open the interactive menu, seeded with remembered sources
+        // (recents + ssh_config hosts).
+        None => App::interactive(known::menu_sources()),
+        Some("-h") | Some("--help") => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Some("demo") => App::demo(demo_diff()),
+        Some(_) => {
+            let specs = discover(&args);
+            if specs.is_empty() {
+                eprintln!("no comparison targets found in: {}", args.join(" "));
+                return ExitCode::from(2);
+            }
+            App::new(specs)
         }
     };
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(entries));
+    let result = run(&mut terminal, app);
     ratatui::restore();
 
-    if let Err(error) = result {
-        eprintln!("error: {error}");
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
-}
-
-/// Decide where packages come from based on CLI args, then compute the diff.
-/// Returns a user-facing error string on any failure.
-fn load_entries(args: &[String]) -> Result<Vec<DiffEntry>, String> {
-    match args.first().map(String::as_str) {
-        None => Err(USAGE.to_string()),
-        Some("demo") => Ok(demo_diff()),
-        Some(remote_arg) => {
-            let local = LocalSource
-                .fetch()
-                .map_err(|e| format!("reading local packages: {e}"))?;
-
-            // A path that exists -> file source; otherwise treat it as an SSH host.
-            let remote = if Path::new(remote_arg).is_file() {
-                FileSource::new(remote_arg)
-                    .fetch()
-                    .map_err(|e| format!("reading remote: {e}"))?
-            } else {
-                let ssh = SshSource::new(remote_arg);
-                match args.get(1) {
-                    // SSH with a state-file fallback.
-                    Some(fallback) => {
-                        let (packages, _origin) =
-                            fetch_with_fallback(&ssh, &FileSource::new(fallback))
-                                .map_err(|e| format!("reading remote (ssh+fallback): {e}"))?;
-                        packages
-                    }
-                    None => ssh.fetch().map_err(|e| format!("reading remote (ssh): {e}"))?,
-                }
-            };
-
-            Ok(diff(&local, &remote))
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
         }
     }
 }
 
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
-    // The loop runs until the App says to quit. All key meaning lives in
-    // `app.handle_key`; here we only react to the resulting state.
+    // Channel carrying (fetch epoch, result) from worker threads to the UI.
+    // The epoch lets the app drop results from cancelled/superseded fetches.
+    let (tx, rx) = mpsc::channel::<(u64, Result<Vec<DiffEntry>, String>)>();
+
     while !app.should_quit {
         terminal.draw(|frame| draw(frame, &mut app))?;
 
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key(key.code);
+        // Non-blocking input: poll with a timeout so the loop keeps spinning to
+        // animate the spinner and to drain the channel while a fetch runs.
+        if event::poll(Duration::from_millis(120))? {
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                // Ctrl-C always quits, even mid-typing (where 'q' is just text).
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    break;
+                }
+                app.handle_key(key.code);
+            }
+        } else {
+            app.tick(); // no input this cycle -> advance the spinner
         }
 
-        // The user confirmed an action: drop out of the TUI, run it with the
-        // real terminal attached, then exit back to the shell.
+        // If a fetch was requested, run it on a worker thread. The spec is
+        // `Send + 'static`, so it moves into the thread cleanly; the result
+        // comes back over the channel.
+        if let Some(spec) = app.take_fetch_request() {
+            known::record(&spec); // remember it for next time's menu
+            let tx = tx.clone();
+            let epoch = app.current_epoch();
+            thread::spawn(move || {
+                let _ = tx.send((epoch, fetch_diff(&spec)));
+            });
+        }
+
+        // Drain any completed fetches.
+        while let Ok((epoch, result)) = rx.try_recv() {
+            app.on_fetch_result(epoch, result);
+        }
+
+        // Apply confirmed changes: suspend the TUI, run yay, then refresh.
         if app.take_apply_request() {
             let plan = Plan::from_selection(&app.entries, &app.selected);
             if !plan.is_empty() {
-                return apply_and_exit(terminal, &plan);
+                suspend_and_run(terminal, &plan)?;
+                app.refresh(); // re-fetch so the diff reflects what changed
             }
         }
     }
     Ok(())
 }
 
-/// Suspend the TUI, run the plan with inherited stdio (so yay's output and sudo
-/// prompt are visible and interactive), wait for the user, then return — the
-/// app exits afterward. We re-enter the alt screen only briefly via `restore`
-/// being idempotent; `main` performs the final teardown.
-fn apply_and_exit(terminal: &mut DefaultTerminal, plan: &Plan) -> std::io::Result<()> {
-    // Leave raw mode + alternate screen so commands print to the normal shell.
-    ratatui::restore();
-    let _ = terminal; // we're done drawing; the handle is no longer used
-
-    let result = plan.execute();
-
-    print!("\n[pkgsync] done — press Enter to exit…");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-
-    result
+/// Run on a worker thread: gather local + remote package lists and diff them.
+/// Errors are stringified here because they cross a thread boundary.
+fn fetch_diff(spec: &SourceSpec) -> Result<Vec<DiffEntry>, String> {
+    let local = LocalSource.fetch().map_err(|e| format!("local: {e}"))?;
+    let remote = spec.fetch().map_err(|e| format!("remote: {e}"))?;
+    Ok(diff(&local, &remote))
 }
 
-/// Paint one frame from the current `App` state. Takes `&mut App` because the
-/// list highlight is a *stateful* widget — it reads and updates `list_state`.
+/// Leave the TUI, run the plan with the real terminal attached (so yay's output
+/// and sudo prompt work), wait for the user, then re-enter the TUI.
+fn suspend_and_run(terminal: &mut DefaultTerminal, plan: &Plan) -> std::io::Result<()> {
+    ratatui::restore();
+
+    let _ = plan.execute(); // failures are printed by execute itself
+
+    print!("\n[pkgsync] press Enter to return…");
+    std::io::stdout().flush()?;
+    std::io::stdin().read_line(&mut String::new())?;
+
+    *terminal = ratatui::init();
+    terminal.clear()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
 fn draw(frame: &mut Frame, app: &mut App) {
+    // Clone the screen tag (cheap; only Error carries a String) so we don't
+    // hold an immutable borrow of `app` while the arms borrow it mutably.
+    match app.screen.clone() {
+        Screen::Menu => render_menu(frame, app),
+        Screen::Input => render_input(frame, app),
+        Screen::Picker => render_picker(frame, app),
+        Screen::Loading => render_loading(frame, app),
+        Screen::Diff => render_diff(frame, app),
+        Screen::Error(message) => render_error(frame, &message),
+    }
+}
+
+fn render_menu(frame: &mut Frame, app: &mut App) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+
+    let items: Vec<ListItem> = app
+        .menu_items
+        .iter()
+        .map(|item| {
+            let line = match item {
+                // A remembered source: show its label in cyan.
+                MenuItem::Source(spec) => Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(spec.label(), Style::new().fg(Color::Cyan)),
+                ]),
+                MenuItem::NewSsh => {
+                    Line::from("+ SSH — enter a host / IP".to_string()).dim()
+                }
+                MenuItem::NewFile => {
+                    Line::from("+ Local file — enter a path".to_string()).dim()
+                }
+            };
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::bordered().title(" pkgsync — choose a source "))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .highlight_symbol("› ");
+    frame.render_stateful_widget(list, body, &mut app.menu_state);
+
+    let help = Line::from(vec![
+        hotkey("↑↓"),
+        Span::raw(" move  "),
+        hotkey("Enter"),
+        Span::raw(" select  "),
+        hotkey("q"),
+        Span::raw(" quit"),
+    ]);
+    frame.render_widget(Paragraph::new(help), footer);
+}
+
+fn render_input(frame: &mut Frame, app: &App) {
+    let (title, prompt, placeholder) = match app.input_kind {
+        InputKind::Ssh => (
+            " SSH host ",
+            "Hostname or IP address:",
+            "e.g. office   or   100.74.x.y",
+        ),
+        InputKind::File => (
+            " local file ",
+            "Path to a .pkgs file:",
+            "e.g. ~/dev/linux/dotconfigs/state/office.pkgs",
+        ),
+    };
+
+    let area = centered_rect(frame.area(), 72, 6);
+
+    // Show the live buffer, or a dim placeholder when it's empty.
+    let value_line = if app.input.is_empty() {
+        Line::from(vec![Span::raw("> "), Span::styled(placeholder, Style::new().dim())])
+    } else {
+        Line::from(format!("> {}", app.input))
+    };
+    let lines = vec![
+        Line::from(prompt),
+        value_line,
+        Line::from(""),
+        Line::from("Enter connect · Esc back".dim()),
+    ];
+
+    let popup = Paragraph::new(lines).block(Block::bordered().title(title));
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+
+    // Place a real terminal cursor right after the typed text. Inside the
+    // border (+1,+1); the value is line index 1; "> " is a 2-column prefix.
+    let cursor_x = (area.x + 1 + 2 + app.input.chars().count() as u16)
+        .min(area.x + area.width.saturating_sub(2));
+    let cursor_y = area.y + 2;
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn render_picker(frame: &mut Frame, app: &mut App) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
+
+    let items: Vec<ListItem> = app.specs.iter().map(|s| ListItem::new(s.label())).collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(" compare against — pick a source "))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .highlight_symbol("› ");
+    frame.render_stateful_widget(list, body, &mut app.picker_state);
+
+    let help = Line::from(vec![
+        hotkey("↑↓"),
+        Span::raw(" move  "),
+        hotkey("Enter"),
+        Span::raw(" choose  "),
+        hotkey("q"),
+        Span::raw(" quit"),
+    ]);
+    frame.render_widget(Paragraph::new(help), footer);
+}
+
+fn render_loading(frame: &mut Frame, app: &App) {
+    let lines = vec![
+        Line::from(format!(
+            "{}  fetching from {} …",
+            app.spinner_frame(),
+            app.loading_label()
+        )),
+        Line::from(""),
+        Line::from("SSH can take a few seconds · Esc to cancel".dim()),
+    ];
+    let area = centered_rect(frame.area(), 64, 5);
+    let popup = Paragraph::new(lines)
+        .centered()
+        .block(Block::bordered().title(" loading "));
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+fn render_error(frame: &mut Frame, message: &str) {
+    let lines = vec![
+        Line::from("fetch failed".bold().red()),
+        Line::from(""),
+        Line::from(message.to_string()),
+        Line::from(""),
+        Line::from("press any key for the source list · q to quit".dim()),
+    ];
+    let area = centered_rect(frame.area(), 70, lines.len() as u16 + 2);
+    let popup = Paragraph::new(lines)
+        .block(Block::bordered().title(" error ").border_style(Style::new().fg(Color::Red)));
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+fn render_diff(frame: &mut Frame, app: &mut App) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let [list_area, detail_area] =
@@ -143,64 +314,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     render_list(frame, list_area, app);
     render_detail(frame, detail_area, app);
-    render_footer(frame, footer, app);
+    render_diff_footer(frame, footer, app);
 
-    // The confirm screen is drawn as a popup *over* the panes.
     if app.mode == Mode::Confirm {
         render_confirm(frame, app);
     }
 }
 
-/// A modal popup listing exactly what will run, awaiting y/n.
-fn render_confirm(frame: &mut Frame, app: &App) {
-    let plan = Plan::from_selection(&app.entries, &app.selected);
-
-    let mut lines = vec![
-        Line::from(format!("About to act on {} package(s):", plan.total()).bold()),
-        Line::from(""),
-    ];
-    // Show the literal commands that will run — no surprises.
-    for cmd in plan.commands() {
-        lines.push(Line::from(vec![
-            Span::raw("  $ "),
-            Span::styled(cmd.display(), Style::new().fg(Color::Cyan)),
-        ]));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(" y ", Style::new().fg(Color::Black).bg(Color::Green)),
-        Span::raw(" apply    "),
-        Span::styled(" n ", Style::new().fg(Color::Black).bg(Color::Red)),
-        Span::raw(" cancel"),
-    ]));
-
-    // Center a box that's 70% wide and tall enough for the content.
-    let height = (lines.len() as u16) + 2; // +2 for the border
-    let area = centered_rect(frame.area(), 70, height);
-
-    let popup = Paragraph::new(lines)
-        .block(Block::bordered().title(" confirm ").border_style(Style::new().fg(Color::Yellow)));
-
-    // `Clear` wipes whatever was underneath so the popup isn't see-through.
-    frame.render_widget(Clear, area);
-    frame.render_widget(popup, area);
-}
-
-/// A rectangle centered in `area`, `percent_x` wide and `height` rows tall.
-fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
-    let [horizontal] = Layout::horizontal([Constraint::Percentage(percent_x)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [centered] = Layout::vertical([Constraint::Length(height.min(area.height))])
-        .flex(Flex::Center)
-        .areas(horizontal);
-    centered
-}
-
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
-    // Build owned `ListItem`s first. This borrows `app` immutably, but the
-    // borrow ends with this statement (the items own their strings), freeing us
-    // to take a *mutable* borrow of `app.list_state` below.
     let items: Vec<ListItem> = app
         .visible()
         .iter()
@@ -210,17 +331,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = summary_title(app);
     let list = List::new(items)
         .block(Block::bordered().title(title))
-        // The highlight style is applied to whichever row `list_state` points
-        // at; the symbol is drawn in the left margin of that row.
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("› ");
 
-    // `render_stateful_widget` is the key call: it hands the widget our
-    // `ListState`, which is how the moving cursor and scrolling work.
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-/// One styled row: `[x] <sym> <action>  <name>          <detail>`.
 fn diff_item(entry: &DiffEntry, selected: bool) -> ListItem<'static> {
     let (symbol, action, color, detail) = match &entry.kind {
         DiffKind::Missing { remote_version } => {
@@ -229,10 +345,7 @@ fn diff_item(entry: &DiffEntry, selected: bool) -> ListItem<'static> {
         DiffKind::Extra { local_version } => {
             ("-", "remove", Color::Red, format!("local {local_version}"))
         }
-        DiffKind::VersionSkew {
-            local_version,
-            remote_version,
-        } => (
+        DiffKind::VersionSkew { local_version, remote_version } => (
             "~",
             "upgrade",
             Color::Yellow,
@@ -241,7 +354,6 @@ fn diff_item(entry: &DiffEntry, selected: bool) -> ListItem<'static> {
     };
 
     let checkbox = if selected { "[x] " } else { "[ ] " };
-
     let line = Line::from(vec![
         Span::raw(checkbox),
         Span::styled(format!("{symbol} "), Style::new().fg(color)),
@@ -249,11 +361,9 @@ fn diff_item(entry: &DiffEntry, selected: bool) -> ListItem<'static> {
         Span::raw(format!("{:<22}", entry.name)),
         Span::raw(detail).dim(),
     ]);
-
     ListItem::new(line)
 }
 
-/// The right pane: live detail of the highlighted entry.
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let lines = match app.selected_entry() {
         Some(entry) => detail_lines(entry, app.is_selected(&entry.name)),
@@ -275,10 +385,7 @@ fn detail_lines(entry: &DiffEntry, selected: bool) -> Vec<Line<'static>> {
             Color::Red,
             vec![Line::from(format!("local version  : {local_version}"))],
         ),
-        DiffKind::VersionSkew {
-            local_version,
-            remote_version,
-        } => (
+        DiffKind::VersionSkew { local_version, remote_version } => (
             "upgrade",
             Color::Yellow,
             vec![
@@ -303,25 +410,61 @@ fn detail_lines(entry: &DiffEntry, selected: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let key = |k: &'static str| Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(Color::Gray));
+fn render_diff_footer(frame: &mut Frame, area: Rect, app: &App) {
     let help = Line::from(vec![
-        key("↑↓"),
+        hotkey("↑↓"),
         Span::raw(" move  "),
-        key("Tab"),
+        hotkey("Tab"),
         Span::raw(" select  "),
-        key("a/i/u/r"),
+        hotkey("a/i/u/r"),
         Span::raw(" filter  "),
-        key("Enter"),
+        hotkey("Enter"),
         Span::raw(" apply  "),
-        key("q"),
-        Span::raw(" quit   "),
+        hotkey("R"),
+        Span::raw(" reload  "),
+        hotkey("Esc"),
+        Span::raw(" sources  "),
+        hotkey("q"),
+        Span::raw(" quit  "),
         Span::styled(
-            format!("[filter: {}]  [selected: {}]", app.filter.label(), app.selected.len()),
+            format!("[{}] [sel {}]", app.filter.label(), app.selected.len()),
             Style::new().fg(Color::DarkGray),
         ),
     ]);
     frame.render_widget(Paragraph::new(help), area);
+}
+
+fn render_confirm(frame: &mut Frame, app: &App) {
+    let plan = Plan::from_selection(&app.entries, &app.selected);
+
+    let mut lines = vec![
+        Line::from(format!("About to act on {} package(s):", plan.total()).bold()),
+        Line::from(""),
+    ];
+    for cmd in plan.commands() {
+        lines.push(Line::from(vec![
+            Span::raw("  $ "),
+            Span::styled(cmd.display(), Style::new().fg(Color::Cyan)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" y ", Style::new().fg(Color::Black).bg(Color::Green)),
+        Span::raw(" apply    "),
+        Span::styled(" n ", Style::new().fg(Color::Black).bg(Color::Red)),
+        Span::raw(" cancel"),
+    ]));
+
+    let area = centered_rect(frame.area(), 70, lines.len() as u16 + 2);
+    let popup = Paragraph::new(lines)
+        .block(Block::bordered().title(" confirm ").border_style(Style::new().fg(Color::Yellow)));
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+/// A small key-hint chip used in the footers.
+fn hotkey(k: &'static str) -> Span<'static> {
+    Span::styled(format!(" {k} "), Style::new().fg(Color::Black).bg(Color::Gray))
 }
 
 fn summary_title(app: &App) -> String {
@@ -343,8 +486,18 @@ fn counts(entries: &[DiffEntry]) -> (usize, usize, usize) {
     (install, upgrade, remove)
 }
 
-/// Sample data for `pkgsync demo` — lets you see the UI without a second
-/// machine reachable.
+/// A rectangle centered in `area`, `percent_x` wide and `height` rows tall.
+fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
+    let [horizontal] = Layout::horizontal([Constraint::Percentage(percent_x)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [centered] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(horizontal);
+    centered
+}
+
+/// Sample data for `pkgsync demo`.
 fn demo_diff() -> Vec<DiffEntry> {
     vec![
         DiffEntry {

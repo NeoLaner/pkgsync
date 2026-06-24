@@ -7,5 +7,6 @@
 pub mod action;
 pub mod app;
 pub mod diff;
+pub mod known;
 pub mod package;
 pub mod source;
